@@ -1,0 +1,12 @@
+mode = simulate
+topology = mesh
+num_cores_x = 2
+num_cores_y = 1
+ncm_qubits = 4
+ncp_qubits = 130
+edge_weight_range = 1.0,2.0
+circuit_folders = circuits/qft
+placers = RANDOM, BFS, TRHQA, HQA, GTRHQA
+repeats = 3
+out_csv = results.csv
+plot_file = results_plot.png

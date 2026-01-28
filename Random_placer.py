@@ -1,16 +1,8 @@
 from Placer import BasePlacer
-import networkx as nx
 import random
-from collections import deque
-from pytket import Circuit, OpType
-import copy
-import itertools
 import numpy as np
 import networkx as nx
-import random
-from collections import deque
-from pytket import Circuit, OpType
-import copy
+from pytket import OpType
 import matplotlib.pyplot as plt
 
 class random_placer(BasePlacer):
@@ -190,7 +182,6 @@ class random_placer(BasePlacer):
         total_communication_cost = 0
         qubit_last_qpu = {}        
         timeslices = self.break_into_timeslices(circuit)
-        print(len(timeslices), len(partition))
         
         for i in range(len(timeslices)):
             timeslice = timeslices[i]

@@ -1,8 +1,5 @@
 import networkx as nx
-import numpy as np
-from collections import deque
-from pytket import Circuit, OpType
-from scipy.optimize import linear_sum_assignment
+from pytket import OpType
 
 class BasePlacer:
     """
@@ -15,13 +12,14 @@ class BasePlacer:
         self.name = "BasePlacer"
     
     def break_into_timeslices(self, circuit):
+
+        # print("Breaking circuit into timeslices...")
         """
         Break circuit into timeslices while respecting dependencies.
         Common to all placers.
         """
         gates = list(circuit)
         num_gates = len(gates)
-        print(len(gates),"gatelen")
         # Build dependency graph
         predecessors = {i: set() for i in range(num_gates)}
         successors = {i: set() for i in range(num_gates)}
@@ -60,7 +58,6 @@ class BasePlacer:
 
             time_slices.append([gates[i] for i in current_slice])
             ready = next_ready
-        print(sum(len(i) for i in time_slices),"got")   
         return time_slices
     
     def get_weighted_distance(self, multicore_arch, node1, node2):

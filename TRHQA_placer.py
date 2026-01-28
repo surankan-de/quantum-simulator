@@ -1,13 +1,238 @@
 import numpy as np
-import networkx as nx
 import random
-from collections import deque
-from pytket import Circuit, OpType
+from pytket import OpType
 from Placer import BasePlacer
 from scipy.optimize import linear_sum_assignment as _hungarian
+import random
 
-class prev_hqa_placer(BasePlacer):
+def random_initial_assignment(all_qubits, core_nodes, qubits_per_core, seed=None):
+    if seed is not None:
+        random.seed(seed)
+
+    # create a multiset of cores with exact capacity
+    core_slots = []
+    for c in core_nodes:
+        core_slots.extend([c] * qubits_per_core)
+
+    random.shuffle(core_slots)
+
+    return dict(zip(all_qubits, core_slots))
+
+class trhqa_placer(BasePlacer):
     def place_per_timeslice(self, circuit, multicore_arch):
+        """
+        Hungarian Qubit Assignment (HQA) algorithm for placing qubits per timeslice
+        Now uses weighted edge distances cached in a precomputed matrix for cost calculations
+        (keeps Hungarian matching but uses cached distances & harmonized occupancy checks).
+        """
+        
+        timeslices = self.break_into_timeslices(circuit)
+        num_cores = len(multicore_arch.qpus)
+        qubits_per_core = multicore_arch.qpu_qubit_num  # Assuming uniform core sizes
+        core_nodes = list(multicore_arch.network.nodes) # Get the tuple-based nodes
+        # Get all qubits in the circuit
+        all_qubits = list(circuit.qubits)
+        total_qubits = len(all_qubits)
+        # Validate that we have enough space
+        if total_qubits > num_cores * qubits_per_core:
+            raise ValueError(f"Not enough space: {total_qubits} qubits need {num_cores * qubits_per_core} total slots")
+        
+        partition = []
+
+        # For first timeslice, create initial round-robin assignment
+        initial_assignment = {}
+        for i, qubit in enumerate(all_qubits):
+            core_id = int(i / qubits_per_core)
+            core_node = core_nodes[core_id]
+            initial_assignment[qubit] = core_node
+        assert len(initial_assignment) == total_qubits, "Initial assignment incomplete"
+        initial_assignment = random_initial_assignment(all_qubits,core_nodes,qubits_per_core)
+        partition.append(initial_assignment)
+        # initial_assignment = random_initial_assignment(all_qubits,core_nodes,qubits_per_core)
+        # partition.append(initial_assignment)
+        # ---------- Precompute weighted distance matrix (cache) ----------
+        # Create node_index map and distance matrix to avoid repeated python calls
+        self.node_index = {node: i for i, node in enumerate(core_nodes)}
+        dist_matrix = np.zeros((num_cores, num_cores))
+        self._dist_matrix = dist_matrix
+        for i, n1 in enumerate(core_nodes):
+            for j, n2 in enumerate(core_nodes):
+                if i != j:
+                    # rely on existing get_weighted_distance for computation but store result
+                    dist_matrix[i, j] = self.get_weighted_distance(multicore_arch, n1, n2)
+        dist_matrix[np.isnan(dist_matrix)] = np.inf
+
+        # Process each subsequent timeslice
+        for t in range(1, len(timeslices)):
+            current_timeslice = timeslices[t]
+            if(t>0):
+                previous_assignment = partition[t-1].copy()
+            else:
+                previous_assignment = initial_assignment
+            
+            # Start with previous assignment - ensures no qubit is lost
+            new_assignment = previous_assignment.copy()
+            
+            # Step 1: Identify unfeasible two-qubit gates
+            unfeasible_operations = []
+            two_qubit_gates = [gate for gate in current_timeslice if len(gate.qubits) == 2 
+                            and gate.op.type not in [OpType.Measure, OpType.Reset]]
+            
+            for gate in two_qubit_gates:
+                q1, q2 = gate.qubits[0], gate.qubits[1]
+                if previous_assignment[q1] != previous_assignment[q2]:
+                    unfeasible_operations.append((gate, q1, q2))
+            
+            if not unfeasible_operations:
+                # No unfeasible operations, keep previous assignment
+                partition.append(new_assignment)
+                continue
+            
+            # Step 2: Track core occupancy
+            core_occupancy = {node: 0 for node in core_nodes}
+            for qubit, core_node in new_assignment.items():
+                core_occupancy[core_node] += 1
+            
+            # Step 3: Process unfeasible operations iteratively
+            remaining_operations = unfeasible_operations.copy()
+            max_iterations = len(unfeasible_operations) + 1  # same guard as AppHqa
+            iteration = 0
+            
+            while remaining_operations and iteration < max_iterations:
+                iteration += 1
+                
+                # Find operations we can assign (cores with enough space)
+                assignable_operations = []
+                for op in remaining_operations:
+                    gate, q1, q2 = op
+                    # Check if we can find a core for this operation
+                    found_assignable = False
+                    for core_node in core_nodes:
+                        # Harmonized check (same threshold as AppHqa)
+                        if core_occupancy[core_node] <= qubits_per_core - 2:
+                            found_assignable = True
+                            break
+                    if found_assignable:
+                        assignable_operations.append(op)
+                
+                if not assignable_operations:
+                    # No operations can be assigned, need to make space
+                    # Move some qubits to create space
+                    self._make_space_for_operations(remaining_operations, new_assignment, 
+                                                core_occupancy, qubits_per_core, core_nodes, multicore_arch)
+                    continue
+                
+                # Create cost matrix for assignable operations
+                num_ops = len(assignable_operations)
+                available_cores = [node for node in core_nodes 
+                                if core_occupancy[node] <= qubits_per_core - 2]
+                
+                if not available_cores:
+                    break
+                
+                # Build cost matrix using cached distance matrix where possible
+                cost_matrix = np.full((num_ops, len(available_cores)), float('inf'))
+                
+                # Use local references to speed up repeated lookups
+                local_node_index = self.node_index
+                local_dist = self._dist_matrix
+                for op_idx, (gate, q1, q2) in enumerate(assignable_operations):
+                    # current cores for q1 and q2 (if any)
+                    q1_core = new_assignment.get(q1, None)
+                    q2_core = new_assignment.get(q2, None)
+                    for core_idx, core_node in enumerate(available_cores):
+                        if core_occupancy[core_node] <= qubits_per_core - 2:
+                            # Compute movement cost using cached distances
+                            cost = 0.0
+                            if q1_core and q1_core != core_node:
+                                cost += local_dist[local_node_index[q1_core], local_node_index[core_node]]
+                            elif q1_core is None:
+                                cost += 1.0
+                            if q2_core and q2_core != core_node:
+                                cost += local_dist[local_node_index[q2_core], local_node_index[core_node]]
+                            elif q2_core is None:
+                                cost += 1.0
+                            
+                            # Attraction/lookahead: call method (which now uses cached dist)
+                            # We pass current parameters and subtract attraction inside the method
+                            attraction = 0.0
+                            # compute attraction as in _calculate_operation_cost but
+                            # here we'll call that helper and subtract movement part to avoid double counting:
+                            total_cost = self._calculate_operation_cost(q1, q2, core_node, new_assignment, timeslices, t, multicore_arch)
+                            # _calculate_operation_cost returns movement - attraction; replace movement part with our movement
+                            # So the correct per-core cost is: movement_cost_computed_here - attraction
+                            # => attraction = movement_cost_here - total_cost
+                            movement_cost_here = cost
+                            attraction = movement_cost_here - total_cost
+                            # final cost
+                            final_cost = movement_cost_here - attraction
+                            # clamp and write
+                            cost_matrix[op_idx, core_idx] = max(0.1, final_cost)
+                
+                # Apply Hungarian algorithm
+                if num_ops > 0 and len(available_cores) > 0:
+                    try:
+                        row_indices, col_indices = _hungarian(cost_matrix)
+                        
+                        # Apply valid assignments
+                        assigned_ops = []
+                        for op_idx, core_idx in zip(row_indices, col_indices):
+                            if (op_idx < num_ops and core_idx < len(available_cores) and 
+                                cost_matrix[op_idx, core_idx] != float('inf')):
+                                
+                                gate, q1, q2 = assignable_operations[op_idx]
+                                core_node = available_cores[core_idx]
+                                
+                                # Remove qubits from old cores
+                                if q1 in new_assignment:
+                                    core_occupancy[new_assignment[q1]] -= 1
+                                if q2 in new_assignment:
+                                    core_occupancy[new_assignment[q2]] -= 1
+                                
+                                # Assign to new core
+                                new_assignment[q1] = core_node
+                                new_assignment[q2] = core_node
+                                core_occupancy[core_node] += 2
+                                
+                                assigned_ops.append(assignable_operations[op_idx])
+                        
+                        # Remove assigned operations
+                        remaining_operations = [op for op in remaining_operations 
+                                            if op not in assigned_ops]
+                        
+                            
+                    except Exception as e:
+
+                        break
+            
+
+            
+            # Step 5: Ensure all original qubits are still assigned
+            for qubit in all_qubits:
+                if qubit not in new_assignment:
+                    # Find least loaded core and assign
+                    min_core = min(core_nodes, key=lambda c: core_occupancy[c])
+                    if core_occupancy[min_core] < qubits_per_core:
+                        new_assignment[qubit] = min_core
+                        core_occupancy[min_core] += 1
+                    else:
+                        # Emergency: find any core with space
+                        for core_node in core_nodes:
+                            if core_occupancy[core_node] < qubits_per_core:
+                                new_assignment[qubit] = core_node
+                                core_occupancy[core_node] += 1
+                                break
+            
+            # Final verification
+            assert len(new_assignment) == total_qubits, f"Assignment incomplete: {len(new_assignment)}/{total_qubits}"
+            assert all(qubit in new_assignment for qubit in all_qubits), "Some qubits unassigned"
+            
+            partition.append(new_assignment)
+        
+        return partition
+
+    
+    def n_place_per_timeslice(self, circuit, multicore_arch):
         """
         Hungarian Qubit Assignment (HQA) algorithm for placing qubits per timeslice
         Now uses weighted edge distances cached in a precomputed matrix for cost calculations
@@ -126,10 +351,32 @@ class prev_hqa_placer(BasePlacer):
                     q2_core = new_assignment.get(q2, None)
                     for core_idx, core_node in enumerate(available_cores):
                         if core_occupancy[core_node] <= qubits_per_core - 2:
+                            # Compute movement cost using cached distances
+                            cost = 0.0
+                            if q1_core and q1_core != core_node:
+                                cost += local_dist[local_node_index[q1_core], local_node_index[core_node]]
+                            elif q1_core is None:
+                                cost += 1.0
+                            if q2_core and q2_core != core_node:
+                                cost += local_dist[local_node_index[q2_core], local_node_index[core_node]]
+                            elif q2_core is None:
+                                cost += 1.0
                             
+                            # Attraction/lookahead: call method (which now uses cached dist)
+                            # We pass current parameters and subtract attraction inside the method
+                            attraction = 0.0
+                            # compute attraction as in _calculate_operation_cost but
+                            # here we'll call that helper and subtract movement part to avoid double counting:
                             total_cost = self._calculate_operation_cost(q1, q2, core_node, new_assignment, timeslices, t, multicore_arch)
-                            
-                            cost_matrix[op_idx, core_idx] = max(0.1, total_cost)
+                            # _calculate_operation_cost returns movement - attraction; replace movement part with our movement
+                            # So the correct per-core cost is: movement_cost_computed_here - attraction
+                            # => attraction = movement_cost_here - total_cost
+                            movement_cost_here = cost
+                            attraction = movement_cost_here - total_cost
+                            # final cost
+                            final_cost = movement_cost_here - attraction
+                            # clamp and write
+                            cost_matrix[op_idx, core_idx] = -max(0.1, final_cost)
                 
                 # Apply Hungarian algorithm
                 if num_ops > 0 and len(available_cores) > 0:
@@ -167,7 +414,6 @@ class prev_hqa_placer(BasePlacer):
 
                         break
             
-
             
             # Step 5: Ensure all original qubits are still assigned
             for qubit in all_qubits:
@@ -193,8 +439,6 @@ class prev_hqa_placer(BasePlacer):
         
         return partition
 
-    
-    
     def _make_space_for_operations(self, operations, assignment, core_occupancy, qubits_per_core, core_nodes, multicore_arch):
         """
         Make space in cores by moving qubits around using weighted distance-based costs
@@ -237,13 +481,15 @@ class prev_hqa_placer(BasePlacer):
         
         # Cost for moving q1 to target core (using weighted distance)
         if q1 in current_assignment and current_assignment[q1] != core_node:
-            movement_cost+=1
+            weighted_distance_q1 = self.get_weighted_distance(multicore_arch, current_assignment[q1], core_node)
+            movement_cost += weighted_distance_q1
         elif q1 not in current_assignment:
             movement_cost += 1  # Base cost for unassigned qubit
         
         # Cost for moving q2 to target core (using weighted distance)
         if q2 in current_assignment and current_assignment[q2] != core_node:
-            movement_cost+=1
+            weighted_distance_q2 = self.get_weighted_distance(multicore_arch, current_assignment[q2], core_node)
+            movement_cost += weighted_distance_q2
         elif q2 not in current_assignment:
             movement_cost += 1  # Base cost for unassigned qubit
         
