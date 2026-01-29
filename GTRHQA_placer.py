@@ -1,5 +1,9 @@
+import itertools
+import numpy as np
+import networkx as nx
+from collections import deque
+from pytket import Circuit, OpType
 from Placer import BasePlacer
-from pytket import OpType
 import random
 
 def random_initial_assignment(all_qubits, core_nodes, qubits_per_core, seed=None):
@@ -64,7 +68,7 @@ class gtrhqa_placer(BasePlacer):
                 prev_assignment = partition[t - 1]
             else:
                 prev_assignment = initial_assignment
-            new_assignment = dict(prev_assignment)
+            new_assignment = dict(prev_assignment) 
 
             two_qubit_gates = [
                 g for g in current_timeslice if len(g.qubits) == 2 and g.op.type not in [OpType.Measure, OpType.Reset]
@@ -109,17 +113,18 @@ class gtrhqa_placer(BasePlacer):
                         cost += 1
                     cost_matrix[i, j] = cost
 
-
+            
             avail_count = len(available_cores)
             num_ops = len(unfeasible_ops)
 
+            avail_core_idxs = np.array([self.node_index[c] for c in available_cores], dtype=np.int32)
             occupancy_arr = np.array([core_occupancy[c] for c in available_cores], dtype=np.float32)
 
             if num_ops == 0 or avail_count == 0:
                 pass
             else:
-                assigned_op_for_core = -np.ones(avail_count, dtype=np.int32)  
-                assigned_core_for_op = -np.ones(num_ops, dtype=np.int32)     
+                assigned_op_for_core = -np.ones(avail_count, dtype=np.int32) 
+                assigned_core_for_op = -np.ones(num_ops, dtype=np.int32)      
                 core_available_mask = np.ones(avail_count, dtype=bool)
 
                 finite_mask = np.isfinite(cost_matrix)
@@ -136,17 +141,18 @@ class gtrhqa_placer(BasePlacer):
                         break
 
                     rows_idx = np.nonzero(ops_remaining_mask)[0]
-                    sub = cost_matrix[rows_idx][:, cols_idx]
+                    sub = cost_matrix[rows_idx][:, cols_idx] 
 
                     if not np.isfinite(sub).any():
                         break
 
                     huge = 1e12
                     sub_masked = np.where(np.isfinite(sub), sub, huge)
-                    rel_col = np.argmin(sub_masked, axis=1)                   
+                    rel_col = np.argmin(sub_masked, axis=1)                  
                     chosen_costs = sub_masked[np.arange(sub_masked.shape[0]), rel_col]
                     chosen_cores = cols_idx[rel_col]                          
-                    chosen_ops = rows_idx                                    
+                    chosen_ops = rows_idx                                     
+
                     unique_cores, inv = np.unique(chosen_cores, return_inverse=True)
                     picks_rows = []
                     picks_cores = []
@@ -156,7 +162,7 @@ class gtrhqa_placer(BasePlacer):
                             continue
                         local_costs = chosen_costs[idxs]
                         best_local_i = idxs[int(np.argmin(local_costs))]
-                        op_to_assign = int(chosen_ops[best_local_i])  
+                        op_to_assign = int(chosen_ops[best_local_i]) 
                         picks_rows.append(op_to_assign)
                         picks_cores.append(int(core_idx))
 
@@ -219,7 +225,6 @@ class gtrhqa_placer(BasePlacer):
 
 
 
-            # Ensure every qubit is assigned
             for q in all_qubits:
                 if q not in new_assignment:
                     min_core = min(core_nodes, key=lambda c: core_occupancy[c])
