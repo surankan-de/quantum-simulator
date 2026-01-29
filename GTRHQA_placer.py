@@ -45,12 +45,9 @@ class gtrhqa_placer(BasePlacer):
 
         # ---------- Initial round-robin assignment ----------
         initial_assignment = {q: core_nodes[int(i / qubits_per_core)] for i, q in enumerate(all_qubits)}
-        # print("Initial assignment:", initial_assignment)
-        # initial_assignment = random_initial_assignment(all_qubits,core_nodes,qubits_per_core)
 
-        # partition.append(initial_assignment)
+        partition.append(initial_assignment)
 
-        # ---------- Precompute weighted distance matrix ----------
         dist_matrix = np.zeros((num_cores, num_cores))
         self._dist_matrix = dist_matrix
         self.node_index = {node: i for i, node in enumerate(core_nodes)}
@@ -62,7 +59,6 @@ class gtrhqa_placer(BasePlacer):
              
 
 
-        # ---------- Process each timeslice ----------
         for t in range(0, len(timeslices)):
             current_timeslice = timeslices[t]
             if(t>0):
@@ -72,7 +68,6 @@ class gtrhqa_placer(BasePlacer):
                 prev_assignment = initial_assignment
             new_assignment = dict(prev_assignment)  # shallow copy (not deepcopy)
 
-            # Identify 2-qubit gates that span different cores
             two_qubit_gates = [
                 g for g in current_timeslice if len(g.qubits) == 2 and g.op.type not in [OpType.Measure, OpType.Reset]
             ]
@@ -86,7 +81,6 @@ class gtrhqa_placer(BasePlacer):
                 partition.append(new_assignment)
                 continue
 
-            # Track core occupancy
             core_occupancy = {node: 0 for node in core_nodes}
             for q, c in new_assignment.items():
                 core_occupancy[c] += 1
@@ -99,7 +93,6 @@ class gtrhqa_placer(BasePlacer):
             num_ops = len(unfeasible_ops)
             num_avail = len(available_cores)
 
-            # ---------- Vectorized cost matrix computation ----------
             assignments = new_assignment
             get_dist = lambda n1, n2: self._dist_matrix[self.node_index[n1], self.node_index[n2]]
             cost_matrix = np.empty((num_ops, num_avail))
@@ -118,10 +111,6 @@ class gtrhqa_placer(BasePlacer):
                         cost += 1
                     cost_matrix[i, j] = cost
 
-            # ---------- Greedy vectorized assignment ----------
-            
-            # ==== Fast vectorized greedy assignment (replacement for argsort loop) ====
-            # Convert core occupancy and available_cores into index-based NumPy structures
             avail_count = len(available_cores)
             num_ops = len(unfeasible_ops)
 

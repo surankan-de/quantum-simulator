@@ -46,11 +46,7 @@ class trhqa_placer(BasePlacer):
             core_node = core_nodes[core_id]
             initial_assignment[qubit] = core_node
         assert len(initial_assignment) == total_qubits, "Initial assignment incomplete"
-        initial_assignment = random_initial_assignment(all_qubits,core_nodes,qubits_per_core)
         partition.append(initial_assignment)
-        # initial_assignment = random_initial_assignment(all_qubits,core_nodes,qubits_per_core)
-        # partition.append(initial_assignment)
-        # ---------- Precompute weighted distance matrix (cache) ----------
         # Create node_index map and distance matrix to avoid repeated python calls
         self.node_index = {node: i for i, node in enumerate(core_nodes)}
         dist_matrix = np.zeros((num_cores, num_cores))
